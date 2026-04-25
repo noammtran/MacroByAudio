@@ -8,9 +8,9 @@ import time
 import ctypes
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, DoubleVar, Frame, IntVar, Listbox, StringVar, Text, Tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import END, DoubleVar, IntVar, StringVar, filedialog, messagebox
 
+import customtkinter as ctk
 import numpy as np
 import soundcard as sc
 from pynput.keyboard import Controller, Key
@@ -24,6 +24,11 @@ BLOCK_SIZE = 1024
 FINGERPRINT_BINS = 64
 FINGERPRINT_WINDOW = 2048
 FINGERPRINT_HOP = 1024
+FINGERPRINT_WINDOW_VECTOR = np.hanning(FINGERPRINT_WINDOW).astype(np.float32)
+DETECTION_INTERVAL_SECONDS = 0.05
+SCORE_EVENT_INTERVAL_SECONDS = 0.10
+MAX_UI_EVENTS_PER_TICK = 200
+MAX_LOG_LINES = 500
 
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
@@ -108,10 +113,9 @@ def fingerprint(samples: np.ndarray) -> np.ndarray:
     if len(samples) < FINGERPRINT_WINDOW:
         return np.array([], dtype=np.float32)
 
-    window = np.hanning(FINGERPRINT_WINDOW).astype(np.float32)
     frames: list[np.ndarray] = []
     for start in range(0, len(samples) - FINGERPRINT_WINDOW + 1, FINGERPRINT_HOP):
-        frame = samples[start : start + FINGERPRINT_WINDOW] * window
+        frame = samples[start : start + FINGERPRINT_WINDOW] * FINGERPRINT_WINDOW_VECTOR
         spectrum = np.abs(np.fft.rfft(frame))[1 : FINGERPRINT_BINS + 1]
         spectrum = np.log1p(spectrum).astype(np.float32)
         spectrum -= float(np.mean(spectrum))
@@ -284,6 +288,8 @@ class AudioDetector(threading.Thread):
         self.event_queue = event_queue
         self.stop_event = stop_event
         self.last_trigger = 0.0
+        self.last_score_event = 0.0
+        self.last_analysis = 0.0
 
     def run(self) -> None:
         try:
@@ -303,11 +309,20 @@ class AudioDetector(threading.Thread):
             with device.recorder(samplerate=SAMPLE_RATE, channels=2, blocksize=BLOCK_SIZE) as recorder:
                 while not self.stop_event.is_set():
                     block = mono(recorder.record(numframes=BLOCK_SIZE))
-                    rolling = np.concatenate([rolling[len(block) :], block])
-                    score = self.best_score(rolling, sample_len)
-                    self.event_queue.put(("score", score))
+                    block_len = len(block)
+                    rolling[:-block_len] = rolling[block_len:]
+                    rolling[-block_len:] = block
 
                     now = time.monotonic()
+                    if now - self.last_analysis < DETECTION_INTERVAL_SECONDS:
+                        continue
+                    self.last_analysis = now
+
+                    score = self.best_score(rolling, sample_len)
+                    if now - self.last_score_event >= SCORE_EVENT_INTERVAL_SECONDS:
+                        self.last_score_event = now
+                        self.event_queue.put(("score", score))
+
                     if score >= self.threshold and now - self.last_trigger >= self.cooldown_s:
                         self.last_trigger = now
                         self.event_queue.put(("trigger", score))
@@ -316,7 +331,7 @@ class AudioDetector(threading.Thread):
 
     def best_score(self, rolling: np.ndarray, sample_len: int) -> float:
         best = 0.0
-        offsets = (0, BLOCK_SIZE // 2, BLOCK_SIZE, BLOCK_SIZE + BLOCK_SIZE // 2)
+        offsets = (0, BLOCK_SIZE // 2, BLOCK_SIZE)
         for offset in offsets:
             end = len(rolling) - offset
             start = end - sample_len
@@ -330,11 +345,11 @@ class AudioDetector(threading.Thread):
 
 
 class AudioMacroApp:
-    def __init__(self, root: Tk) -> None:
+    def __init__(self, root: ctk.CTk) -> None:
         self.root = root
         self.root.title("Audio Macro Trigger")
-        self.root.geometry("1080x720")
-        self.root.minsize(980, 640)
+        self.root.geometry("1200x780")
+        self.root.minsize(1080, 700)
 
         self.devices: list[sc.Microphone] = []
         self.sample = np.array([], dtype=np.float32)
@@ -342,6 +357,9 @@ class AudioMacroApp:
         self.stop_event = threading.Event()
         self.recording = False
         self.playing_sample = False
+        self.macro_running = False
+        self.log_messages: list[str] = []
+        self.log_render_pending = False
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.runner = MacroRunner()
         self.admin = is_admin()
@@ -363,108 +381,143 @@ class AudioMacroApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def configure_style(self) -> None:
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure("TFrame", background="#f6f7f9")
-        style.configure("TLabelframe", background="#f6f7f9", borderwidth=1, relief="solid")
-        style.configure("TLabelframe.Label", background="#f6f7f9", foreground="#20242a", font=("Segoe UI", 10, "bold"))
-        style.configure("TLabel", background="#f6f7f9", foreground="#20242a", font=("Segoe UI", 9))
-        style.configure("Muted.TLabel", background="#f6f7f9", foreground="#5f6670")
-        style.configure("Status.TLabel", background="#eceff3", foreground="#20242a", padding=(8, 4))
-        style.configure("TButton", font=("Segoe UI", 9), padding=(10, 5))
-        style.configure("Primary.TButton", font=("Segoe UI", 9, "bold"), padding=(12, 6))
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("blue")
 
     def build_ui(self) -> None:
-        self.root.configure(background="#f6f7f9")
+        self.root.configure(fg_color="#eef2f6")
 
-        outer = ttk.Frame(self.root, padding=14)
-        outer.pack(fill=BOTH, expand=True)
-        outer.columnconfigure(0, weight=3)
-        outer.columnconfigure(1, weight=2)
-        outer.rowconfigure(3, weight=1)
+        outer = ctk.CTkFrame(self.root, fg_color="#eef2f6", corner_radius=0)
+        outer.pack(fill="both", expand=True, padx=22, pady=20)
+        outer.columnconfigure(0, weight=0)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(1, weight=1)
 
-        header = ttk.Frame(outer)
-        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        header = ctk.CTkFrame(outer, fg_color="transparent")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 18))
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="Audio Macro Trigger", font=("Segoe UI", 15, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=1, sticky="e")
+        ctk.CTkLabel(header, text="Audio Macro Trigger", font=ctk.CTkFont(size=24, weight="bold"), text_color="#111827").grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(header, text="Listen for system audio, then run precise keyboard and mouse macros.", font=ctk.CTkFont(size=13), text_color="#5f6b7a").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ctk.CTkLabel(header, textvariable=self.status_var, fg_color="#ffffff", text_color="#253040", corner_radius=10, padx=14, pady=8).grid(row=0, column=1, rowspan=2, sticky="e")
 
-        audio_group = ttk.LabelFrame(outer, text="Audio")
-        audio_group.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(0, 12))
+        sidebar = ctk.CTkScrollableFrame(
+            outer,
+            fg_color="transparent",
+            width=360,
+            height=640,
+            scrollbar_button_color="#cbd5e1",
+            scrollbar_button_hover_color="#94a3b8",
+        )
+        sidebar.grid(row=1, column=0, sticky="nsew", padx=(0, 16))
+        sidebar.columnconfigure(0, weight=1)
+
+        workspace = ctk.CTkFrame(outer, fg_color="transparent")
+        workspace.grid(row=1, column=1, sticky="nsew")
+        workspace.columnconfigure(0, weight=1)
+        workspace.rowconfigure(1, weight=3)
+        workspace.rowconfigure(2, weight=2)
+
+        audio_group = self.create_card(sidebar, "Audio Source", "Choose the output device to monitor.")
+        audio_group.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         audio_group.columnconfigure(0, weight=1)
         audio_group.columnconfigure(1, weight=0)
+        self.device_combo = ctk.CTkComboBox(audio_group, variable=self.device_var, values=[], state="readonly", height=36, border_color="#cbd5e1", button_color="#2563eb", button_hover_color="#1d4ed8")
+        self.device_combo.grid(row=2, column=0, sticky="ew", padx=(14, 8), pady=(0, 14))
+        ctk.CTkButton(audio_group, text="Refresh", command=self.refresh_devices, width=92, height=36, fg_color="#334155", hover_color="#1f2937").grid(row=2, column=1, padx=(0, 14), pady=(0, 14))
 
-        ttk.Label(audio_group, text="Audio device").grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 2))
-        self.device_combo = ttk.Combobox(audio_group, textvariable=self.device_var, state="readonly")
-        self.device_combo.grid(row=1, column=0, sticky="ew", padx=(10, 8), pady=(0, 10))
-        ttk.Button(audio_group, text="Refresh", command=self.refresh_devices).grid(row=1, column=1, sticky="e", padx=(0, 10), pady=(0, 10))
+        tuning_group = self.create_card(sidebar, "Detection", "Tune speed, accuracy and repeat behavior.")
+        tuning_group.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        tuning_group.columnconfigure(0, weight=1)
+        tuning_group.columnconfigure(1, weight=1)
+        self.add_number_control(tuning_group, "Sample seconds", self.sample_seconds_var, 0.5, 10.0, 0.5, 2, 0)
+        self.add_number_control(tuning_group, "Detect seconds", self.detect_seconds_var, 0.1, 5.0, 0.1, 2, 1)
+        self.add_number_control(tuning_group, "Threshold", self.threshold_var, 0.1, 0.95, 0.05, 3, 0)
+        self.add_number_control(tuning_group, "Cooldown seconds", self.cooldown_var, 0.0, 30.0, 0.5, 3, 1)
+        self.add_number_control(tuning_group, "Action jitter ms", self.jitter_var, 0, 500, 5, 4, 0)
 
-        tuning_group = ttk.LabelFrame(outer, text="Detection")
-        tuning_group.grid(row=1, column=1, sticky="ew", pady=(0, 12))
-        for column in range(3):
-            tuning_group.columnconfigure(column, weight=1)
-        self.add_spinbox(tuning_group, "Sample seconds", self.sample_seconds_var, 0.5, 10.0, 0.5, 0, 0)
-        self.add_spinbox(tuning_group, "Detect seconds", self.detect_seconds_var, 0.1, 5.0, 0.1, 0, 1)
-        self.add_spinbox(tuning_group, "Threshold", self.threshold_var, 0.1, 0.95, 0.05, 0, 2)
-        self.add_spinbox(tuning_group, "Cooldown seconds", self.cooldown_var, 0.0, 30.0, 0.5, 1, 0)
-        self.add_spinbox(tuning_group, "Action jitter ms", self.jitter_var, 0, 500, 5, 1, 1)
-
-        sample_group = ttk.LabelFrame(outer, text="Sample & Actions")
-        sample_group.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 12))
-        for column in range(6):
-            sample_group.columnconfigure(column, weight=0)
-        sample_group.columnconfigure(6, weight=1)
-        self.record_button = ttk.Button(sample_group, text="Record sample", command=self.record_sample)
-        self.record_button.grid(row=0, column=0, sticky="w", padx=(10, 6), pady=10)
-        self.play_sample_button = ttk.Button(sample_group, text="Play sample", command=self.play_sample, state="disabled")
-        self.play_sample_button.grid(row=0, column=1, sticky="w", padx=6, pady=10)
-        ttk.Button(sample_group, text="Import sample", command=self.import_sample).grid(row=0, column=2, sticky="w", padx=6, pady=10)
-        ttk.Button(sample_group, text="Save profile", command=self.save_profile).grid(row=0, column=3, sticky="w", padx=6, pady=10)
-        ttk.Button(sample_group, text="Test macro", command=self.test_macro).grid(row=0, column=4, sticky="w", padx=6, pady=10)
-        self.listen_button = ttk.Button(sample_group, text="Start listening", command=self.toggle_listening, style="Primary.TButton")
-        self.listen_button.grid(row=0, column=6, sticky="e", padx=10, pady=10)
-        self.activity_bar = ttk.Progressbar(sample_group, mode="indeterminate", length=160)
-        self.activity_bar.grid(row=1, column=0, columnspan=7, sticky="ew", padx=10, pady=(0, 10))
+        sample_group = self.create_card(sidebar, "Sample & Control", "Capture, verify and test before listening.")
+        sample_group.grid(row=2, column=0, sticky="ew")
+        sample_group.columnconfigure(0, weight=1)
+        sample_group.columnconfigure(1, weight=1)
+        self.record_button = ctk.CTkButton(sample_group, text="Record sample", command=self.record_sample, height=38, fg_color="#2563eb", hover_color="#1d4ed8")
+        self.record_button.grid(row=2, column=0, sticky="ew", padx=(14, 6), pady=(0, 10))
+        self.play_sample_button = ctk.CTkButton(sample_group, text="Play sample", command=self.play_sample, state="disabled", height=38, fg_color="#0f766e", hover_color="#115e59")
+        self.play_sample_button.grid(row=2, column=1, sticky="ew", padx=(6, 14), pady=(0, 10))
+        ctk.CTkButton(sample_group, text="Import sample", command=self.import_sample, height=36, fg_color="#64748b", hover_color="#475569").grid(row=3, column=0, sticky="ew", padx=(14, 6), pady=(0, 10))
+        ctk.CTkButton(sample_group, text="Save profile", command=self.save_profile, height=36, fg_color="#64748b", hover_color="#475569").grid(row=3, column=1, sticky="ew", padx=(6, 14), pady=(0, 10))
+        ctk.CTkButton(sample_group, text="Test macro", command=self.test_macro, height=36, fg_color="#475569", hover_color="#334155").grid(row=4, column=0, sticky="ew", padx=(14, 6), pady=(0, 12))
+        self.listen_button = ctk.CTkButton(sample_group, text="Start listening", command=self.toggle_listening, height=36, fg_color="#15803d", hover_color="#166534")
+        self.listen_button.grid(row=4, column=1, sticky="ew", padx=(6, 14), pady=(0, 12))
+        self.activity_bar = ctk.CTkProgressBar(sample_group, mode="indeterminate", height=8, corner_radius=4, progress_color="#2563eb")
+        self.activity_bar.grid(row=5, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 14))
+        self.activity_bar.set(0)
         if not self.admin:
-            ttk.Label(sample_group, text="Warning: not running as Administrator. Elevated apps may ignore macro keys.", style="Muted.TLabel").grid(row=2, column=0, columnspan=7, sticky="w", padx=10, pady=(0, 10))
+            ctk.CTkLabel(sample_group, text="Not running as Administrator. Elevated apps may ignore macro keys.", wraplength=310, justify="left", text_color="#a16207").grid(row=6, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 14))
 
-        macro_group = ttk.LabelFrame(outer, text="Macro Steps")
-        macro_group.grid(row=3, column=0, sticky="nsew", padx=(0, 10))
-        macro_group.rowconfigure(1, weight=1)
+        score_group = self.create_card(workspace, "Live Detector", "Watch matching confidence while the target sound plays.")
+        score_group.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        score_group.columnconfigure(0, weight=1)
+        score_header = ctk.CTkFrame(score_group, fg_color="transparent")
+        score_header.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
+        score_header.columnconfigure(0, weight=1)
+        ctk.CTkLabel(score_header, textvariable=self.score_var, font=ctk.CTkFont(size=16, weight="bold"), text_color="#111827").grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(score_header, text="Trigger when score >= Threshold", text_color="#66717f").grid(row=0, column=1, sticky="e")
+        self.score_bar = ctk.CTkProgressBar(score_group, mode="determinate", height=12, corner_radius=8, progress_color="#16a34a")
+        self.score_bar.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 14))
+        self.score_bar.set(0)
+
+        macro_group = self.create_card(workspace, "Macro Steps", "One action per line: action, delay_ms or action, min-max.")
+        macro_group.grid(row=1, column=0, sticky="nsew", pady=(0, 12))
+        macro_group.rowconfigure(2, weight=1)
         macro_group.columnconfigure(0, weight=1)
-        ttk.Label(macro_group, text="One action per line: action, delay_ms or action, min-max", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
-        self.macro_text = Text(macro_group, height=16, wrap="none")
-        self.macro_text.configure(font=("Consolas", 10), relief="solid", borderwidth=1, padx=8, pady=8, undo=True)
-        self.macro_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.macro_text = ctk.CTkTextbox(macro_group, wrap="none", font=ctk.CTkFont(family="Consolas", size=13), border_width=1, border_color="#cbd5e1", fg_color="#fbfcfd", text_color="#17202a")
+        self.macro_text.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 14))
         self.macro_text.insert(END, "right_click, 900-1100\nright_click, 0\n")
 
-        events_group = ttk.LabelFrame(outer, text="Events")
-        events_group.grid(row=3, column=1, sticky="nsew")
-        events_group.rowconfigure(1, weight=1)
+        events_group = self.create_card(workspace, "Events", "Runtime log for detection, sample capture and macro execution.")
+        events_group.grid(row=2, column=0, sticky="nsew")
+        events_group.rowconfigure(2, weight=1)
         events_group.columnconfigure(0, weight=1)
-        ttk.Label(events_group, textvariable=self.score_var, style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
-        self.event_list = Listbox(events_group, height=16)
-        self.event_list.configure(font=("Consolas", 9), relief="solid", borderwidth=1, activestyle="none")
-        self.event_list.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.event_list = ctk.CTkTextbox(events_group, font=ctk.CTkFont(family="Consolas", size=12), border_width=1, border_color="#cbd5e1", fg_color="#fbfcfd", text_color="#253040")
+        self.event_list.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 14))
 
     @staticmethod
-    def add_spinbox(parent: Frame, label: str, variable, from_: float, to: float, increment: float, row: int, column: int) -> None:
-        box = ttk.Frame(parent)
-        box.grid(row=row, column=column, sticky="ew", padx=10, pady=(10, 8))
-        box.columnconfigure(0, weight=1)
-        ttk.Label(box, text=label).grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(box, textvariable=variable, from_=from_, to=to, increment=increment, width=12).grid(row=1, column=0, sticky="ew", pady=(4, 0))
+    def create_card(parent, title: str, subtitle: str = "") -> ctk.CTkFrame:
+        card = ctk.CTkFrame(parent, fg_color="#ffffff", corner_radius=12, border_width=1, border_color="#d9e2ec")
+        card.columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=15, weight="bold"), text_color="#111827").grid(row=0, column=0, columnspan=8, sticky="w", padx=14, pady=(14, 2))
+        if subtitle:
+            ctk.CTkLabel(card, text=subtitle, text_color="#66717f", wraplength=620, justify="left").grid(row=1, column=0, columnspan=8, sticky="w", padx=14, pady=(0, 12))
+        return card
+
+    def add_number_control(self, parent, label: str, variable, from_: float, to: float, increment: float, row: int, column: int) -> None:
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        box.grid(row=row, column=column, sticky="ew", padx=14, pady=(0, 12))
+        box.columnconfigure(1, weight=1)
+        ctk.CTkLabel(box, text=label, text_color="#56616f", font=ctk.CTkFont(size=12)).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ctk.CTkButton(box, text="-", width=28, height=30, fg_color="#e2e8f0", hover_color="#cbd5e1", text_color="#17202a", command=lambda: self.adjust_number(variable, from_, to, -increment)).grid(row=1, column=0, sticky="w")
+        ctk.CTkEntry(box, textvariable=variable, width=74, height=30, justify="center", border_color="#cbd5e1").grid(row=1, column=1, sticky="ew", padx=5)
+        ctk.CTkButton(box, text="+", width=28, height=30, fg_color="#e2e8f0", hover_color="#cbd5e1", text_color="#17202a", command=lambda: self.adjust_number(variable, from_, to, increment)).grid(row=1, column=2, sticky="e")
+
+    @staticmethod
+    def adjust_number(variable, from_: float, to: float, delta: float) -> None:
+        try:
+            current = float(variable.get())
+        except Exception:
+            current = from_
+        next_value = min(to, max(from_, current + delta))
+        if isinstance(variable, IntVar):
+            variable.set(int(round(next_value)))
+        else:
+            variable.set(round(next_value, 3))
 
     def refresh_devices(self) -> None:
         self.devices = list(sc.all_microphones(include_loopback=True))
         names = [device.name for device in self.devices]
-        self.device_combo["values"] = names
+        self.device_combo.configure(values=names)
         loopback = next((name for name in names if "loopback" in name.lower()), names[0] if names else "")
         if loopback and not self.device_var.get():
-            self.device_var.set(loopback)
+            self.device_combo.set(loopback)
         self.log(f"Found {len(names)} audio input/loopback devices")
 
     def record_sample(self) -> None:
@@ -477,7 +530,7 @@ class AudioMacroApp:
         self.recording = True
         self.record_button.configure(text="Recording...", state="disabled")
         self.play_sample_button.configure(state="disabled")
-        self.activity_bar.start(12)
+        self.activity_bar.start()
         self.status_var.set(f"Recording {seconds:.1f}s sample...")
         self.log(f"Recording sample for {seconds:.1f}s")
         threading.Thread(target=self._record_sample_worker, args=(seconds,), daemon=True).start()
@@ -500,7 +553,7 @@ class AudioMacroApp:
             return
         self.playing_sample = True
         self.play_sample_button.configure(text="Playing...", state="disabled")
-        self.activity_bar.start(12)
+        self.activity_bar.start()
         self.status_var.set(f"Playing sample: {len(self.sample) / SAMPLE_RATE:.2f}s")
         self.log("Playing sample")
         threading.Thread(target=self._play_sample_worker, daemon=True).start()
@@ -562,25 +615,28 @@ class AudioMacroApp:
             stop_event=self.stop_event,
         )
         self.detector.start()
-        self.listen_button.configure(text="Stop listening")
+        self.listen_button.configure(text="Stop listening", fg_color="#dc2626", hover_color="#b91c1c")
         self.status_var.set("Listening")
         self.log("Listening started")
 
     def stop_listening(self) -> None:
         self.stop_event.set()
-        self.listen_button.configure(text="Start listening")
+        self.listen_button.configure(text="Start listening", fg_color="#15803d", hover_color="#166534")
         self.status_var.set(f"Idle ({'Administrator' if self.admin else 'User'})")
         self.log("Listening stopped")
 
     def consume_events(self) -> None:
-        while True:
+        processed = 0
+        pending_score: float | None = None
+        while processed < MAX_UI_EVENTS_PER_TICK:
             try:
                 event, payload = self.events.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
 
             if event == "score":
-                self.score_var.set(f"Score: {float(payload):.3f}")
+                pending_score = float(payload)
             elif event == "trigger":
                 score = float(payload)
                 self.log(f"Triggered at score {score:.3f}")
@@ -591,6 +647,8 @@ class AudioMacroApp:
                     self.log(str(exc))
             elif event == "macro_done":
                 self.log("Macro finished")
+            elif event == "macro_idle":
+                self.macro_running = False
             elif event == "sample":
                 seconds = int(payload) / SAMPLE_RATE
                 self.recording = False
@@ -619,9 +677,18 @@ class AudioMacroApp:
                 self.status_var.set("Error")
                 self.log(f"Error: {payload}")
 
-        self.root.after(100, self.consume_events)
+        if pending_score is not None:
+            self.score_var.set(f"Score: {pending_score:.3f}")
+            self.score_bar.set(min(1.0, max(0.0, pending_score)))
+
+        next_delay = 20 if not self.events.empty() else 100
+        self.root.after(next_delay, self.consume_events)
 
     def start_macro_thread(self, steps: list[MacroStep]) -> None:
+        if self.macro_running:
+            self.log("Macro already running; trigger skipped")
+            return
+        self.macro_running = True
         jitter_ms = int(self.jitter_var.get())
         threading.Thread(target=self._macro_worker, args=(steps, jitter_ms), daemon=True).start()
 
@@ -631,6 +698,8 @@ class AudioMacroApp:
             self.events.put(("macro_done", None))
         except Exception as exc:
             self.events.put(("error", f"Macro failed: {exc}"))
+        finally:
+            self.events.put(("macro_idle", None))
 
     def save_profile(self) -> None:
         sample_path = APP_DIR / "sample.npy"
@@ -677,8 +746,19 @@ class AudioMacroApp:
 
     def log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
-        self.event_list.insert(END, f"{timestamp}  {message}")
-        self.event_list.yview_moveto(1)
+        self.log_messages.append(f"{timestamp}  {message}")
+        if len(self.log_messages) > MAX_LOG_LINES:
+            self.log_messages = self.log_messages[-MAX_LOG_LINES:]
+        if not self.log_render_pending:
+            self.log_render_pending = True
+            self.root.after(50, self.render_log)
+
+    def render_log(self) -> None:
+        self.log_render_pending = False
+        self.event_list.delete("1.0", END)
+        if self.log_messages:
+            self.event_list.insert(END, "\n".join(self.log_messages) + "\n")
+            self.event_list.see(END)
 
     def on_close(self) -> None:
         self.stop_event.set()
@@ -686,7 +766,7 @@ class AudioMacroApp:
 
 
 def main() -> None:
-    root = Tk()
+    root = ctk.CTk()
     AudioMacroApp(root)
     root.mainloop()
 

@@ -6,6 +6,8 @@ It is designed for workflows where a specific app or game sound should trigger a
 
 ## Features
 
+- Modern CustomTkinter dashboard with a live detection score meter.
+- Long-running detection optimizations: throttled fingerprint matching, throttled UI score updates, and bounded event logs.
 - Record sound samples from system audio with WASAPI loopback.
 - Play recorded samples back before using them for detection.
 - Detect sounds with a spectrum fingerprint, making detection less sensitive to volume changes.
@@ -126,6 +128,13 @@ If the app triggers too often, raise **Threshold** or **Detect seconds**.
 - Increase **Threshold**.
 - Record a sample that contains only the unique part of the sound.
 
+### The app feels slow after running for a long time
+
+- Keep **Cooldown seconds** high enough so macros do not queue up repeatedly.
+- Avoid very long samples unless needed.
+- Use **Detect seconds** around `0.5-0.8` for lower CPU use and faster detection.
+- The event log is capped to recent entries, so long sessions should stay responsive.
+
 ## Project Structure
 
 ```text
@@ -145,3 +154,11 @@ Runtime files such as `profile.json` and `sample.npy` are ignored by Git because
 - This app sends standard system input. It does not bypass anti-cheat or input protection.
 - For elevated target apps, run this app as Administrator.
 - Detection quality depends heavily on the sample. A short, clean, unique sound works best.
+
+## Tech Stack
+
+- Python
+- CustomTkinter
+- SoundCard
+- NumPy
+- pynput
